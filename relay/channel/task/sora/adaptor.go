@@ -133,6 +133,12 @@ func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, erro
 	if info.Action == constant.TaskActionRemix {
 		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, info.OriginTaskID), nil
 	}
+	// 兼容非标准 OpenAI 路径的第三方服务（如网宿 edgecloudapp）：
+	// 标准路径: baseURL = "https://api.openai.com" → "{base}/v1/videos"
+	// 非标准路径: baseURL 已含版本前缀 (如 ".../v2/gws/{prefix}") → "{base}/videos"
+	if strings.Contains(a.baseURL, "/v1/") || strings.Contains(a.baseURL, "/v2/") {
+		return fmt.Sprintf("%s/videos", a.baseURL), nil
+	}
 	return fmt.Sprintf("%s/v1/videos", a.baseURL), nil
 }
 
@@ -158,6 +164,14 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		var bodyMap map[string]interface{}
 		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
 			bodyMap["model"] = info.UpstreamModelName
+			// 兼容第三方 API（如网宿 edgecloudapp）要求 seconds 为数字类型：
+			// newapi 的 TaskSubmitReq 将 seconds 定义为 string，
+			// 转发时自动将可转换为数字的字符串字段转为 float64
+			if sec, ok := bodyMap["seconds"].(string); ok {
+				if v, err := strconv.ParseFloat(sec, 64); err == nil {
+					bodyMap["seconds"] = v
+				}
+			}
 			if newBody, err := common.Marshal(bodyMap); err == nil {
 				return bytes.NewReader(newBody), nil
 			}
@@ -263,7 +277,15 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 		return nil, fmt.Errorf("invalid task_id")
 	}
 
-	uri := fmt.Sprintf("%s/v1/videos/%s", baseUrl, taskID)
+	var uri string
+	// 兼容非标准 OpenAI 路径（如网宿 edgecloudapp 的 /v2/gws/{prefix} 路径）：
+	// 标准路径: baseURL = "https://api.openai.com" → "{base}/v1/videos/{task_id}"
+	// 非标准路径: baseURL 已含版本前缀 (如 ".../v2/gws/{prefix}") → "{base}/videos/{task_id}"
+	if strings.Contains(baseUrl, "/v1/") || strings.Contains(baseUrl, "/v2/") {
+		uri = fmt.Sprintf("%s/videos/%s", baseUrl, taskID)
+	} else {
+		uri = fmt.Sprintf("%s/v1/videos/%s", baseUrl, taskID)
+	}
 
 	req, err := http.NewRequest(http.MethodGet, uri, nil)
 	if err != nil {

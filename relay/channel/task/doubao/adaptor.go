@@ -132,18 +132,63 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 	return nil
 }
 
-// EstimateBilling 检测请求 metadata 中是否包含视频输入，返回视频折扣 OtherRatio。
+// EstimateBilling 检测请求 metadata 中的视频输入和分辨率，返回对应的 OtherRatio。
+// 计费逻辑：管理员设置 ModelRatio 为 720P 不含视频的较高费率，
+// 系统根据视频输入和分辨率自动乘以折扣：
+//   - 720P 含视频: videoInputRatio
+//   - 1080P 不含视频: resolutionRatio1080P
+//   - 1080P 含视频: videoInputRatio1080P（已包含分辨率折扣，无需再乘 resolutionRatio1080P）
 func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
 	req, err := relaycommon.GetTaskRequest(c)
 	if err != nil {
 		return nil
 	}
-	if hasVideoInMetadata(req.Metadata) {
-		if ratio, ok := GetVideoInputRatio(info.OriginModelName); ok {
-			return map[string]float64{"video_input": ratio}
+
+	modelName := info.OriginModelName
+	hasVideo := hasVideoInMetadata(req.Metadata)
+	resolution := getResolutionFromMetadata(req.Metadata)
+	is1080P := Is1080P(resolution)
+
+	ratios := make(map[string]float64)
+
+	if is1080P {
+		// 1080P 分辨率
+		if hasVideo {
+			// 1080P 含视频输入：使用 1080P 视频输入折扣（已包含分辨率折扣）
+			if ratio, ok := GetVideoInputRatio1080P(modelName); ok {
+				ratios["video_input"] = ratio
+			}
+		} else {
+			// 1080P 不含视频输入：使用分辨率折扣
+			if ratio, ok := GetResolutionRatio1080P(modelName); ok {
+				ratios["resolution"] = ratio
+			}
+		}
+	} else {
+		// 720P/480P 分辨率（默认）
+		if hasVideo {
+			if ratio, ok := GetVideoInputRatio(modelName); ok {
+				ratios["video_input"] = ratio
+			}
 		}
 	}
-	return nil
+
+	if len(ratios) == 0 {
+		return nil
+	}
+	return ratios
+}
+
+// getResolutionFromMetadata 从 metadata 中提取分辨率信息。
+// 优先读取 metadata.resolution 字段。
+func getResolutionFromMetadata(metadata map[string]interface{}) string {
+	if metadata == nil {
+		return ""
+	}
+	if resolution, ok := metadata["resolution"].(string); ok && resolution != "" {
+		return resolution
+	}
+	return ""
 }
 
 // hasVideoInMetadata 直接检查 metadata 的 content 数组是否包含 video_url 条目，

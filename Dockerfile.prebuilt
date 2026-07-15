@@ -1,0 +1,48 @@
+# ============================================================
+# Dockerfile.prebuilt - 使用本地预构建的前端 dist 编译 Docker 镜像
+# 说明:
+#   与官方 Dockerfile 的区别：跳过 bun 前端构建阶段，直接使用本地
+#   已构建好的 web/default/dist 和 web/classic/dist，只编译 Go 后端。
+#   适用于 bun 版本差异导致 Docker 内前端构建失败的场景，同时构建速度更快。
+#
+# 使用前提:
+#   先在本地执行前端构建：
+#     cd web/default && bun install && bun run build
+#     cd web/classic && pnpm install && npx rsbuild build
+#   或使用 build-docker.sh --with-frontend（会自动构建前端）
+# ============================================================
+
+FROM golang:1.26.1-alpine AS builder
+
+ENV GO111MODULE=on CGO_ENABLED=0
+ARG TARGETOS
+ARG TARGETARCH
+ENV GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64}
+ENV GOEXPERIMENT=greenteagc
+# 使用国内 Go 模块代理，避免 proxy.golang.org 不可达导致 go mod download 失败
+ENV GOPROXY=https://goproxy.cn,direct
+
+WORKDIR /build
+
+ADD go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+# 使用本地预构建的前端 dist（.dockerignore 需排除规则放行 dist）
+COPY web/default/dist ./web/default/dist
+COPY web/classic/dist ./web/classic/dist
+
+RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata libasan8 wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates
+
+COPY --from=builder /build/new-api /
+COPY LICENSE NOTICE THIRD-PARTY-LICENSES.md /licenses/
+EXPOSE 3000
+WORKDIR /data
+ENTRYPOINT ["/new-api"]

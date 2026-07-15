@@ -194,9 +194,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 6. 将 OtherRatios 应用到基础额度
+	//    注意：以 "_" 开头的 key 为诊断信息（仅用于日志），不参与计费计算
 	if !common.StringsContains(constant.TaskPricePatches, modelName) {
-		for _, ra := range info.PriceData.OtherRatios {
-			if ra != 1.0 {
+		for k, ra := range info.PriceData.OtherRatios {
+			if ra != 1.0 && !strings.HasPrefix(k, "_") {
 				info.PriceData.Quota = int(float64(info.PriceData.Quota) * ra)
 			}
 		}

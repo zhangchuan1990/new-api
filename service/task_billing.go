@@ -16,23 +16,34 @@ import (
 
 // LogTaskConsumption 记录任务消费日志和统计信息（仅记录，不涉及实际扣费）。
 // 实际扣费已由 BillingSession（PreConsumeBilling + SettleBilling）完成。
+//
+// 日志格式说明：
+//   - 计费参数（无前缀 key）：实际参与扣费的倍率值
+//   - 诊断信息（_ 前缀 key）：辅助核对金额的详细信息，不参与计费
+//     _vidu_xxx 系列来自 Vidu adaptor 的 EstimateBilling 返回值
 func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo) {
 	tokenName := c.GetString("token_name")
 	logContent := fmt.Sprintf("操作 %s", info.Action)
 	// 支持任务仅按次计费
 	if common.StringsContains(constant.TaskPricePatches, info.OriginModelName) {
 		logContent = fmt.Sprintf("%s，按次计费", logContent)
-	} else {
-		if len(info.PriceData.OtherRatios) > 0 {
-			var contents []string
-			for key, ra := range info.PriceData.OtherRatios {
-				if 1.0 != ra {
-					contents = append(contents, fmt.Sprintf("%s: %.2f", key, ra))
-				}
+	} else if len(info.PriceData.OtherRatios) > 0 {
+		var billingContents []string
+		var diagContents []string
+		for key, ra := range info.PriceData.OtherRatios {
+			if strings.HasPrefix(key, "_") {
+				// 诊断信息：转换为可读格式
+				diagContents = append(diagContents, formatDiagKey(key, ra))
+			} else if ra != 1.0 {
+				// 计费参数：实际的费用倍率
+				billingContents = append(billingContents, fmt.Sprintf("%s: %.2f", key, ra))
 			}
-			if len(contents) > 0 {
-				logContent = fmt.Sprintf("%s, 计算参数：%s", logContent, strings.Join(contents, ", "))
-			}
+		}
+		if len(billingContents) > 0 {
+			logContent = fmt.Sprintf("%s, 计算参数：%s", logContent, strings.Join(billingContents, ", "))
+		}
+		if len(diagContents) > 0 {
+			logContent = fmt.Sprintf("%s, [%s]", logContent, strings.Join(diagContents, ", "))
 		}
 	}
 	other := make(map[string]interface{})
@@ -298,4 +309,139 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
 	RecalculateTaskQuota(ctx, task, actualQuota, reason)
+}
+
+// ---------------------------------------------------------------------------
+// 诊断信息格式化（用于 _ 前缀的 OtherRatios key）
+// ---------------------------------------------------------------------------
+
+// formatDiagKey 将 _ 前缀的诊断 key 转换为可读的日志字符串。
+//
+// 支持的 Vidu 诊断 key：
+//   _vidu_seconds      → "时长: 4s"
+//   _vidu_resolution   → "清晰度: 720p" (编码: 1=360p, 2=540p, 3=720p, 4=1080p)
+//   _vidu_action      → "动作: 图生" (编码: 1=图生/文生, 2=首尾帧, 3=参考生)
+//   _vidu_cps         → "单价: 20积分/s"
+//   _vidu_total_credits → "积分: 80"
+//   _vidu_cost_rmb    → "费用: ¥2.50"
+//
+// 支持的 Doubao（火山方舟）诊断 key：
+//   _doubao_seconds    → "时长: 5s"
+//   _doubao_resolution → "分辨率: 720p" (编码: 2=720p, 4=1080p)
+//   _doubao_has_video  → "视频输入: 是/否" (0=否, 1=是)
+//   _doubao_ratio_type → "倍率类型: 基准价/视频折扣(720p)/加价(1080p)/视频折扣(1080p)"
+//   _doubao_ratio_value → "倍率值: 0.61"
+//   _doubao_base_price → "官网基准: ¥46/1M"
+//
+// 其他 _ 前缀 key 以原始格式输出（"key: value"）
+func formatDiagKey(key string, value float64) string {
+	switch key {
+	// ===== Vidu 诊断信息 =====
+	case "_vidu_seconds":
+		return fmt.Sprintf("时长: %.0fs", value)
+	case "_vidu_resolution":
+		return fmt.Sprintf("清晰度: %s", resolutionCodeToString(int(value)))
+	case "_vidu_action":
+		return fmt.Sprintf("动作: %s", actionCodeToString(int(value)))
+	case "_vidu_cps":
+		return fmt.Sprintf("单价: %.0f积分/s", value)
+	case "_vidu_total_credits":
+		return fmt.Sprintf("积分: %.0f", value)
+	case "_vidu_cost_rmb":
+		// 使用 4 位小数，避免与系统实际扣费金额因舍入不一致
+		return fmt.Sprintf("费用: ¥%.4f", value)
+
+	// ===== Doubao（火山方舟）诊断信息 =====
+	case "_doubao_seconds":
+		return fmt.Sprintf("时长: %.0fs", value)
+	case "_doubao_resolution":
+		return fmt.Sprintf("分辨率: %s", doubaoResolutionCodeToString(int(value)))
+	case "_doubao_has_video":
+		if value > 0 {
+			return "视频输入: 是"
+		}
+		return "视频输入: 否"
+	case "_doubao_ratio_type":
+		return fmt.Sprintf("倍率类型: %s", doubaoRatioTypeToString(int(value)))
+	case "_doubao_ratio_value":
+		return fmt.Sprintf("倍率值: %.4f", value)
+	case "_doubao_base_price":
+		if value > 0 {
+			return fmt.Sprintf("官网基准: ¥%.0f/1M", value)
+		}
+		return "官网基准: 未知"
+
+	default:
+		// 未知的诊断 key，保留原始格式
+		return fmt.Sprintf("%s: %.2f", strings.TrimPrefix(key, "_"), value)
+	}
+}
+
+// resolutionCodeToString 将分辨率数值编码转换为可读字符串。
+func resolutionCodeToString(code int) string {
+	switch code {
+	case 1:
+		return "360p"
+	case 2:
+		return "540p"
+	case 3:
+		return "720p"
+	case 4:
+		return "1080p"
+	default:
+		return fmt.Sprintf("未知(%d)", code)
+	}
+}
+
+// actionCodeToString 将动作类型数值编码转换为可读字符串。
+func actionCodeToString(code int) string {
+	switch code {
+	case 1:
+		return "图生"
+	case 2:
+		return "首尾帧"
+	case 3:
+		return "参考生"
+	default:
+		return fmt.Sprintf("未知(%d)", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Doubao（火山方舟）诊断信息辅助函数
+// ---------------------------------------------------------------------------
+
+// doubaoResolutionCodeToString 将 Doubao 分辨率编码转换为可读字符串。
+// 编码规则：2 = 720p, 4 = 1080p
+func doubaoResolutionCodeToString(code int) string {
+	switch code {
+	case 2:
+		return "720p"
+	case 4:
+		return "1080p"
+	default:
+		return fmt.Sprintf("未知(%d)", code)
+	}
+}
+
+// doubaoRatioTypeToString 将 Doubao 倍率类型编码转换为可读字符串。
+//
+// 编码规则：
+//   0 = 基准价（720P 不含视频，无额外倍率）
+//   1 = 视频输入折扣（720P 含视频，相对于基准价的折扣）
+//   2 = 分辨率加价（1080P 不含视频，相对于基准价的加价）
+//   3 = 视频输入折扣（1080P 含视频，已包含分辨率折扣）
+func doubaoRatioTypeToString(code int) string {
+	switch code {
+	case 0:
+		return "基准价(720p不含视频)"
+	case 1:
+		return "视频折扣(720p)"
+	case 2:
+		return "加价(1080p)"
+	case 3:
+		return "视频折扣(1080p)"
+	default:
+		return fmt.Sprintf("未知(%d)", code)
+	}
 }

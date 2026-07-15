@@ -133,11 +133,22 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 }
 
 // EstimateBilling 检测请求 metadata 中的视频输入和分辨率，返回对应的 OtherRatio。
+//
 // 计费逻辑：管理员设置 ModelRatio 为 720P 不含视频的较高费率，
 // 系统根据视频输入和分辨率自动乘以折扣：
-//   - 720P 含视频: videoInputRatio
-//   - 1080P 不含视频: resolutionRatio1080P
-//   - 1080P 含视频: videoInputRatio1080P（已包含分辨率折扣，无需再乘 resolutionRatio1080P）
+//   - 720P 含视频: videoInputRatio（含视频单价 / 720P不含视频单价）
+//   - 1080P 不含视频: resolutionRatio1080P（1080P不含视频单价 / 720P不含视频单价）
+//   - 1080P 含视频: videoInputRatio1080P（1080P含视频单价 / 720P不含视频单价，已包含分辨率折扣）
+//
+// 返回值包含两类 key：
+//   - 计费 key（无前缀）：会被 relay_task.go 乘入 baseQuota，参与实际扣费
+//     （video_input / resolution）
+//   - 诊断 key（_ 前缀）：仅用于日志记录，不参与计费计算
+//     （_doubao_resolution, _doubao_has_video, _doubao_ratio_type 等）
+//
+// 日志输出示例：
+//   操作 generate, 计算参数：video_input: 0.61,
+//   [doubao] 分辨率: 720p, 视频输入: 是, 倍率类型: 视频折扣(720p), 官网基准: ¥46/1M
 func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
 	req, err := relaycommon.GetTaskRequest(c)
 	if err != nil {
@@ -151,17 +162,30 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 
 	ratios := make(map[string]float64)
 
+	// 提取时长（秒），用于日志展示
+	seconds := 0
+	if req.Seconds != "" {
+		if s, err := strconv.Atoi(req.Seconds); err == nil && s > 0 {
+			seconds = s
+		}
+	}
+	if seconds <= 0 {
+		seconds = req.Duration
+	}
+
 	if is1080P {
 		// 1080P 分辨率
 		if hasVideo {
 			// 1080P 含视频输入：使用 1080P 视频输入折扣（已包含分辨率折扣）
 			if ratio, ok := GetVideoInputRatio1080P(modelName); ok {
 				ratios["video_input"] = ratio
+				appendDoubaoDiag(ratios, modelName, "1080p", true, seconds, ratio, 3)
 			}
 		} else {
 			// 1080P 不含视频输入：使用分辨率折扣
 			if ratio, ok := GetResolutionRatio1080P(modelName); ok {
 				ratios["resolution"] = ratio
+				appendDoubaoDiag(ratios, modelName, "1080p", false, seconds, ratio, 2)
 			}
 		}
 	} else {
@@ -169,7 +193,11 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		if hasVideo {
 			if ratio, ok := GetVideoInputRatio(modelName); ok {
 				ratios["video_input"] = ratio
+				appendDoubaoDiag(ratios, modelName, "720p", true, seconds, ratio, 1)
 			}
+		} else {
+			// 720P 不含视频：使用基准 ModelRatio，无额外倍率，但仍输出诊断信息
+			appendDoubaoDiag(ratios, modelName, "720p", false, seconds, 1.0, 0)
 		}
 	}
 
@@ -410,4 +438,62 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	}
 
 	return common.Marshal(openAIVideo)
+}
+
+// ---------------------------------------------------------------------------
+// Doubao 诊断信息辅助函数
+// ---------------------------------------------------------------------------
+
+// appendDoubaoDiag 向 ratios map 追加 _doubao_ 前缀的诊断信息（仅用于日志，不参与计费）。
+//
+// 参数说明：
+//   - modelName: 模型名称（如 doubao-seedance-2-0-260128）
+//   - resolution: 分辨率字符串（"720p" 或 "1080p"）
+//   - hasVideo: 是否包含视频输入
+//   - seconds: 视频时长（秒）
+//   - appliedRatio: 实际应用的倍率值
+//   - ratioTypeCode: 倍率类型编码（0=基准无折扣, 1=视频折扣720p, 2=分辨率加价1080p, 3=视频折扣1080p）
+func appendDoubaoDiag(
+	ratios map[string]float64,
+	modelName string,
+	resolution string,
+	hasVideo bool,
+	seconds int,
+	appliedRatio float64,
+	ratioTypeCode int,
+) {
+	// 分辨率编码：2=720p, 4=1080p
+	resCode := float64(2)
+	if resolution == "1080p" {
+		resCode = 4
+	}
+
+	// 是否有视频输入：1=是, 0=否
+	videoFlag := float64(0)
+	if hasVideo {
+		videoFlag = 1
+	}
+
+	// 查询官网基准价格（720P 不含视频单价，单位：元/百万token）
+	basePrice := getDoubaoBasePrice(modelName)
+
+	ratios["_doubao_resolution"] = resCode           // 分辨率编码
+	ratios["_doubao_has_video"] = videoFlag            // 是否有视频输入
+	ratios["_doubao_seconds"] = float64(seconds)        // 时长(秒)
+	ratios["_doubao_ratio_type"] = float64(ratioTypeCode) // 倍率类型编码
+	ratios["_doubao_ratio_value"] = appliedRatio        // 实际倍率值
+	ratios["_doubao_base_price"] = basePrice            // 官网基准价(元/1M tokens)
+}
+
+// getDoubaoBasePrice 返回指定模型在 720P 不含视频模式下的官网基准价格（元/百万token）。
+// 数据来源：火山方舟官方定价页面。
+func getDoubaoBasePrice(modelName string) float64 {
+	switch modelName {
+	case "doubao-seedance-2-0-260128":
+		return 46.0 // 官网：720P 不含视频 = ¥46/1M tokens
+	case "doubao-seedance-2-0-fast-260128":
+		return 37.0 // 官网：720P 不含视频 = ¥37/1M tokens
+	default:
+		return 0 // 未知模型
+	}
 }

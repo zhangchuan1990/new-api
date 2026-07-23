@@ -81,3 +81,10 @@ type TaskAdaptor interface {
 type OpenAIVideoConverter interface {
 	ConvertToOpenAIVideo(originTask *model.Task) ([]byte, error)
 }
+
+// DoubaoNativeConverter 支持返回火山方舟原生格式响应。
+// 供下游 DoubaoVideo 类型渠道对接使用：下游 ParseTaskResult 期望火山方舟原生格式，
+// 中转 adaptor 通过此接口将存储的 NewAPI 封装格式转换为火山方舟原始响应。
+type DoubaoNativeConverter interface {
+	ConvertToDoubaoNative(originTask *model.Task) ([]byte, error)
+}

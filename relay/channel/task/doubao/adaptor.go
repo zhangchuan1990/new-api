@@ -65,7 +65,9 @@ type responsePayload struct {
 	ID string `json:"id"` // task_id
 }
 
-type responseTask struct {
+// ResponseTask 火山方舟视频任务查询响应结构。
+// 导出供 doubao_newapi 适配器复用（解析 NewAPI 封装内层的原始响应）。
+type ResponseTask struct {
 	ID      string `json:"id"`
 	Model   string `json:"model"`
 	Status  string `json:"status"`
@@ -155,22 +157,63 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		return nil
 	}
 
-	modelName := info.OriginModelName
-	hasVideo := hasVideoInMetadata(req.Metadata)
-	resolution := getResolutionFromMetadata(req.Metadata)
+	// 构建用于计费的 metadata：优先使用客户端显式传入的 metadata，
+	// 对于缺失的 resolution，从原始请求体顶层补充（火山方舟 API 标准位置）。
+	// TaskSubmitReq 不含 Resolution 字段，客户端按火山方舟标准将 resolution 放在顶层时，
+	// 需要在此补充到 metadata 中，否则计费逻辑无法识别 1080p 等分辨率。
+	billingMetadata := make(map[string]interface{})
+	for k, v := range req.Metadata {
+		billingMetadata[k] = v
+	}
+	if _, ok := billingMetadata["resolution"]; !ok {
+		if storage, err := common.GetBodyStorage(c); err == nil {
+			if bodyBytes, err := storage.Bytes(); err == nil {
+				var topFields struct {
+					Resolution string `json:"resolution"`
+				}
+				if err := common.Unmarshal(bodyBytes, &topFields); err == nil && topFields.Resolution != "" {
+					billingMetadata["resolution"] = topFields.Resolution
+				}
+			}
+		}
+	}
+
+	return EstimateBillingFromMetadata(info.OriginModelName, billingMetadata, req.Seconds, req.Duration)
+}
+
+// EstimateBillingFromMetadata 根据模型名和请求 metadata 计算豆包视频的计费倍率。
+// 此函数为包级函数，供 doubao 适配器和 doubao_newapi 适配器共用计费逻辑。
+//
+// 参数：
+//   - modelName: 模型名称（如 doubao-seedance-2-0-260128）
+//   - metadata: 请求中的 metadata 字段（包含 resolution、content 等信息）
+//   - secondsStr: 时长字符串（如 "4"）
+//   - duration: 时长整数值（当 secondsStr 为空时的回退值）
+//
+// 返回值：
+//   - map[string]float64: 计费倍率映射，key 为 video_input/resolution 等计费维度
+//     以及 _doubao_ 前缀的诊断信息（仅用于日志，不参与计费）
+func EstimateBillingFromMetadata(
+	modelName string,
+	metadata map[string]interface{},
+	secondsStr string,
+	duration int,
+) map[string]float64 {
+	hasVideo := hasVideoInMetadata(metadata)
+	resolution := getResolutionFromMetadata(metadata)
 	is1080P := Is1080P(resolution)
 
 	ratios := make(map[string]float64)
 
 	// 提取时长（秒），用于日志展示
 	seconds := 0
-	if req.Seconds != "" {
-		if s, err := strconv.Atoi(req.Seconds); err == nil && s > 0 {
+	if secondsStr != "" {
+		if s, err := strconv.Atoi(secondsStr); err == nil && s > 0 {
 			seconds = s
 		}
 	}
 	if seconds <= 0 {
-		seconds = req.Duration
+		seconds = duration
 	}
 
 	if is1080P {
@@ -253,6 +296,31 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	req, err := relaycommon.GetTaskRequest(c)
 	if err != nil {
 		return nil, err
+	}
+
+	// 补充从原始请求体顶层提取火山方舟标准字段到 metadata。
+	// TaskSubmitReq 不含 Resolution/GenerateAudio 等字段，客户端按火山方舟 API 标准
+	// 将这些字段放在顶层时，需要在此补充到 metadata 中，否则 convertToRequestPayload
+	// 的 UnmarshalMetadata 读不到，上游请求会丢失这些字段。
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]interface{})
+	}
+	if storage, err := common.GetBodyStorage(c); err == nil {
+		if bodyBytes, err := storage.Bytes(); err == nil {
+			var topFields struct {
+				Resolution    string `json:"resolution"`
+				GenerateAudio *bool  `json:"generate_audio"`
+			}
+			if err := common.Unmarshal(bodyBytes, &topFields); err == nil {
+				if _, ok := req.Metadata["resolution"]; !ok && topFields.Resolution != "" {
+					req.Metadata["resolution"] = topFields.Resolution
+				}
+				// generate_audio 使用指针区分"未发送"（nil）和"显式发送 false"
+				if _, ok := req.Metadata["generate_audio"]; !ok && topFields.GenerateAudio != nil {
+					req.Metadata["generate_audio"] = *topFields.GenerateAudio
+				}
+			}
+		}
 	}
 
 	body, err := a.convertToRequestPayload(&req)
@@ -363,8 +431,13 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
 
+	// 时长设置：优先使用 Seconds（字符串），回退到 Duration（int）。
+	// 客户端按火山方舟 API 标准发送 duration 数字字段时，会解析到 req.Duration，
+	// 仅处理 req.Seconds 会导致 duration 丢失，上游按默认时长生成。
 	if sec, _ := strconv.Atoi(req.Seconds); sec > 0 {
 		r.Duration = lo.ToPtr(dto.IntValue(sec))
+	} else if req.Duration > 0 {
+		r.Duration = lo.ToPtr(dto.IntValue(req.Duration))
 	}
 
 	r.Content = lo.Reject(r.Content, func(c ContentItem, _ int) bool { return c.Type == "text" })
@@ -377,7 +450,7 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*
 }
 
 func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
-	resTask := responseTask{}
+	resTask := ResponseTask{}
 	if err := common.Unmarshal(respBody, &resTask); err != nil {
 		return nil, errors.Wrap(err, "unmarshal task result failed")
 	}
@@ -415,7 +488,7 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, error) {
-	var dResp responseTask
+	var dResp ResponseTask
 	if err := common.Unmarshal(originTask.Data, &dResp); err != nil {
 		return nil, errors.Wrap(err, "unmarshal doubao task data failed")
 	}

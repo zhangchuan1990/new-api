@@ -49,4 +49,15 @@ func SetVideoRouter(router *gin.Engine) {
 		// Maps to: /?Action=CVSync2AsyncSubmitTask&Version=2022-08-31 and /?Action=CVSync2AsyncGetResult&Version=2022-08-31
 		jimengOfficialGroup.POST("/", controller.RelayTask)
 	}
+
+	// 火山方舟原生 API 路由（供下游 DoubaoVideo 类型渠道对接）。
+	// 下游 NewAPI 的 DoubaoVideo 适配器硬编码使用 /api/v3/contents/generations/tasks 路径，
+	// 中转需提供此路由才能被下游调用，内部复用 RelayTask/RelayTaskFetch 处理。
+	doubaoNativeRouter := router.Group("/api/v3")
+	doubaoNativeRouter.Use(middleware.RouteTag("relay"))
+	doubaoNativeRouter.Use(middleware.TokenAuth(), middleware.Distribute())
+	{
+		doubaoNativeRouter.POST("/contents/generations/tasks", controller.RelayTask)
+		doubaoNativeRouter.GET("/contents/generations/tasks/:task_id", controller.RelayTaskFetch)
+	}
 }

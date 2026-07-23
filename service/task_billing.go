@@ -295,10 +295,12 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	}
 
 	// 计算 OtherRatios 乘积（视频折扣、时长等）
+	// 注意：以 _ 前缀开头的键是诊断信息（如 _doubao_resolution、_doubao_seconds 等），
+	// 仅用于日志展示，不参与计费。必须过滤，否则会导致 otherMultiplier 异常放大（数百倍）。
 	otherMultiplier := 1.0
 	if bc := task.PrivateData.BillingContext; bc != nil {
-		for _, r := range bc.OtherRatios {
-			if r != 1.0 && r > 0 {
+		for k, r := range bc.OtherRatios {
+			if r != 1.0 && r > 0 && !strings.HasPrefix(k, "_") {
 				otherMultiplier *= r
 			}
 		}

@@ -56,8 +56,12 @@ const (
 	ChannelTypeReplicate      = 56
 	ChannelTypeCodex          = 57
 	ChannelTypeAdvancedCustom = 58
+	// ChannelTypeDoubaoNewAPI 豆包视频(NewAPI中转兼容)通道。
+	// 用于通过第三方 NewAPI 中转调用豆包视频模型，复用 doubao 计费逻辑，
+	// 但协议层走 NewAPI 内部路由（/v1/video/generations）而非火山方舟原生路径。
+	// ID 取 70 与官方预留间隔，避免未来官方新增通道类型时冲突。
+	ChannelTypeDoubaoNewAPI = 70
 	ChannelTypeDummy          // this one is only for count, do not add any channel after this
-
 )
 
 var ChannelBaseURLs = []string{
@@ -120,6 +124,20 @@ var ChannelBaseURLs = []string{
 	"https://api.replicate.com",                 //56
 	"https://chatgpt.com",                       //57
 	"",                                          //58
+	// 59-69 预留缓冲位，避免未来官方新增通道类型时冲突
+	"",                                          //59
+	"",                                          //60
+	"",                                          //61
+	"",                                          //62
+	"",                                          //63
+	"",                                          //64
+	"",                                          //65
+	"",                                          //66
+	"",                                          //67
+	"",                                          //68
+	"",                                          //69
+	// 70 DoubaoNewAPI：用户必须手动配置 baseURL（第三方 NewAPI 中转地址）
+	"",                                          //70
 }
 
 var ChannelTypeNames = map[int]string{
@@ -178,6 +196,7 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeReplicate:      "Replicate",
 	ChannelTypeCodex:          "ChatGPT Subscription (Codex)",
 	ChannelTypeAdvancedCustom: "Advanced Custom",
+	ChannelTypeDoubaoNewAPI:   "DoubaoNewAPI",
 }
 
 func GetChannelTypeName(channelType int) string {

@@ -378,6 +378,8 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	}
 
 	isOpenAIVideoAPI := strings.HasPrefix(c.Request.RequestURI, "/v1/videos/")
+	// 火山方舟原生 API 路径（供下游 DoubaoVideo 类型渠道对接）
+	isDoubaoNativeAPI := strings.HasPrefix(c.Request.RequestURI, "/api/v3/contents/generations/tasks/")
 
 	// Gemini/Vertex 支持实时查询：用户 fetch 时直接从上游拉取最新状态
 	if realtimeResp := tryRealtimeFetch(originTask, isOpenAIVideoAPI); len(realtimeResp) > 0 {
@@ -399,6 +401,28 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 				return
 			}
 			respBody = openAIVideoData
+			return
+		}
+		taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("not_implemented:%s", originTask.Platform), "not_implemented", http.StatusNotImplemented)
+		return
+	}
+
+	// 火山方舟原生 API 格式: 走各 adaptor 的 ConvertToDoubaoNative
+	// 下游 DoubaoVideo 类型渠道的 ParseTaskResult 期望火山方舟原生格式响应，
+	// 中转 adaptor 需将存储的 NewAPI 封装格式转换为火山方舟原始响应。
+	if isDoubaoNativeAPI {
+		adaptor := GetTaskAdaptor(originTask.Platform)
+		if adaptor == nil {
+			taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("invalid channel id: %d", originTask.ChannelId), "invalid_channel_id", http.StatusBadRequest)
+			return
+		}
+		if converter, ok := adaptor.(channel.DoubaoNativeConverter); ok {
+			nativeData, err := converter.ConvertToDoubaoNative(originTask)
+			if err != nil {
+				taskResp = service.TaskErrorWrapper(err, "convert_to_doubao_native_failed", http.StatusInternalServerError)
+				return
+			}
+			respBody = nativeData
 			return
 		}
 		taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("not_implemented:%s", originTask.Platform), "not_implemented", http.StatusNotImplemented)

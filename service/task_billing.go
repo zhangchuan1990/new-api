@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -27,10 +28,10 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo) {
 	// 支持任务仅按次计费
 	if common.StringsContains(constant.TaskPricePatches, info.OriginModelName) {
 		logContent = fmt.Sprintf("%s，按次计费", logContent)
-	} else if len(info.PriceData.OtherRatios) > 0 {
+	} else if otherRatios := info.PriceData.OtherRatios(); len(otherRatios) > 0 {
 		var billingContents []string
 		var diagContents []string
-		for key, ra := range info.PriceData.OtherRatios {
+		for key, ra := range otherRatios {
 			if strings.HasPrefix(key, "_") {
 				// 诊断信息：转换为可读格式
 				diagContents = append(diagContents, formatDiagKey(key, ra))
@@ -61,6 +62,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo) {
 		other["is_model_mapped"] = true
 		other["upstream_model_name"] = info.UpstreamModelName
 	}
+	attachQuotaSaturation(c, info, other)
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{
 		ChannelId: info.ChannelId,
 		ModelName: info.OriginModelName,
@@ -136,8 +138,8 @@ func taskBillingOther(task *model.Task) map[string]interface{} {
 			other["model_ratio"] = bc.ModelRatio
 		}
 		other["group_ratio"] = bc.GroupRatio
-		if len(bc.OtherRatios) > 0 {
-			for k, v := range bc.OtherRatios {
+		if priceData := taskBillingContextPriceData(bc); priceData != nil {
+			for k, v := range priceData.OtherRatios() {
 				other[k] = v
 			}
 		}
@@ -150,6 +152,17 @@ func taskBillingOther(task *model.Task) map[string]interface{} {
 	return other
 }
 
+func taskBillingContextPriceData(bc *model.TaskBillingContext) *types.PriceData {
+	if bc == nil || len(bc.OtherRatios) == 0 {
+		return nil
+	}
+	priceData := &types.PriceData{}
+	if !priceData.ReplaceOtherRatios(bc.OtherRatios) {
+		return nil
+	}
+	return priceData
+}
+
 // taskModelName 从 BillingContext 或 Properties 中获取模型名称。
 func taskModelName(task *model.Task) string {
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.OriginModelName != "" {
@@ -160,16 +173,17 @@ func taskModelName(task *model.Task) string {
 
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，将预扣的 quota 退还给用户（支持钱包和订阅），并退还令牌额度。
-func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) {
+// 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
+func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {
-		return
+		return true
 	}
 
 	// 1. 退还资金来源（钱包或订阅）
 	if err := taskAdjustFunding(task, -quota); err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("退还资金来源失败 task %s: %s", task.TaskID, err.Error()))
-		return
+		return false
 	}
 
 	// 2. 退还令牌额度
@@ -190,12 +204,21 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) {
 		Group:     task.Group,
 		Other:     other,
 	})
+
+	// 4. 资金退款完成后再清除持久化标记。
+	// 回写失败必须显式告警，避免漏掉潜在的重复退款风险。
+	task.Quota = 0
+	if err := task.UpdateQuota(); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("退款成功但清除 task quota 失败 task %s: %s", task.TaskID, err.Error()))
+	}
+	return true
 }
 
 // RecalculateTaskQuota 通用的异步差额结算。
 // actualQuota 是任务完成后的实际应扣额度，与预扣额度 (task.Quota) 做差额结算。
 // reason 用于日志记录（例如 "token重算" 或 "adaptor调整"）。
-func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason string) {
+// clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
+func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason string, clamps ...*common.QuotaClamp) {
 	if actualQuota <= 0 {
 		return
 	}
@@ -226,6 +249,9 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	taskAdjustTokenQuota(ctx, task, quotaDelta)
 
 	task.Quota = actualQuota
+	if err := task.UpdateQuota(); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("差额结算回写 quota 失败 task %s: %s", task.TaskID, err.Error()))
+	}
 
 	var logType int
 	var logQuota int
@@ -242,6 +268,9 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 	other["task_id"] = task.TaskID
 	other["pre_consumed_quota"] = preConsumedQuota
 	other["actual_quota"] = actualQuota
+	for _, clamp := range clamps {
+		attachQuotaSaturationToOther(other, clamp)
+	}
 	model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{
 		UserId:    task.UserId,
 		LogType:   logType,
@@ -252,6 +281,7 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		TokenId:   task.PrivateData.TokenId,
 		Group:     task.Group,
 		Other:     other,
+		NodeName:  task.PrivateData.NodeName,
 	})
 }
 
@@ -298,19 +328,22 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	// 注意：以 _ 前缀开头的键是诊断信息（如 _doubao_resolution、_doubao_seconds 等），
 	// 仅用于日志展示，不参与计费。必须过滤，否则会导致 otherMultiplier 异常放大（数百倍）。
 	otherMultiplier := 1.0
-	if bc := task.PrivateData.BillingContext; bc != nil {
-		for k, r := range bc.OtherRatios {
+	if priceData := taskBillingContextPriceData(task.PrivateData.BillingContext); priceData != nil {
+		for k, r := range priceData.OtherRatios() {
+			// 过滤 _ 前缀诊断键（如 _doubao_resolution、_doubao_seconds），
+			// 这些键仅用于日志展示，不参与计费。upstream 的 OtherRatioMultiplier()
+			// 只过滤无效值（0、负数、NaN、Inf），不会过滤诊断键，必须手动过滤。
 			if r != 1.0 && r > 0 && !strings.HasPrefix(k, "_") {
 				otherMultiplier *= r
 			}
 		}
 	}
 
-	// 计算实际应扣费额度: totalTokens * modelRatio * groupRatio * otherMultiplier
-	actualQuota := int(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier)
+	// 计算实际应扣费额度: totalTokens * modelRatio * groupRatio * otherMultiplier（饱和转换，防止溢出成负数）
+	actualQuota, clamp := common.QuotaFromFloatChecked(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier)
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
-	RecalculateTaskQuota(ctx, task, actualQuota, reason)
+	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
 }
 
 // ---------------------------------------------------------------------------

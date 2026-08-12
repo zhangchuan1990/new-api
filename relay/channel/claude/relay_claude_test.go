@@ -4,12 +4,57 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/QuantumNous/new-api/dto"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func commonPointer[T any](value T) *T {
 	return &value
+}
+
+func TestResponseOpenAI2ClaudeToolUseInputIsObject(t *testing.T) {
+	tests := []struct {
+		name string
+		args string
+		want map[string]interface{}
+	}{
+		{name: "object", args: `{"q":"x"}`, want: map[string]interface{}{"q": "x"}},
+		{name: "empty", args: "", want: map[string]interface{}{}},
+		{name: "invalid", args: "{", want: map[string]interface{}{}},
+		{name: "null", args: "null", want: map[string]interface{}{}},
+		{name: "array", args: `["x"]`, want: map[string]interface{}{}},
+		{name: "string", args: `"x"`, want: map[string]interface{}{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := dto.Message{Role: "assistant"}
+			msg.SetToolCalls([]dto.ToolCallRequest{
+				{
+					ID:   "call_1",
+					Type: "function",
+					Function: dto.FunctionRequest{
+						Name:      "lookup",
+						Arguments: tt.args,
+					},
+				},
+			})
+			resp := relayconvert.ResponseOpenAI2Claude(&dto.OpenAITextResponse{
+				Id:    "chatcmpl_1",
+				Model: "gpt-test",
+				Choices: []dto.OpenAITextResponseChoice{
+					{Message: msg, FinishReason: "tool_calls"},
+				},
+			}, nil)
+
+			require.Len(t, resp.Content, 1)
+			assert.Equal(t, "tool_use", resp.Content[0].Type)
+			assert.Equal(t, tt.want, resp.Content[0].Input)
+		})
+	}
 }
 
 func TestFormatClaudeResponseInfo_MessageStart(t *testing.T) {
@@ -278,7 +323,7 @@ func TestBuildOpenAIStyleUsageFromClaudeUsageDefaultsAggregateCacheCreationTo5m(
 	require.Equal(t, 0, openAIUsage.ClaudeCacheCreation1hTokens)
 }
 
-func TestRequestOpenAI2ClaudeMessage_ClaudeOpus48HighUsesAdaptiveThinking(t *testing.T) {
+func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48HighUsesAdaptiveThinking(t *testing.T) {
 	request := dto.GeneralOpenAIRequest{
 		Model:       "claude-opus-4-8-high",
 		Temperature: commonPointer(0.7),
@@ -292,7 +337,7 @@ func TestRequestOpenAI2ClaudeMessage_ClaudeOpus48HighUsesAdaptiveThinking(t *tes
 		},
 	}
 
-	claudeRequest, err := RequestOpenAI2ClaudeMessage(nil, request)
+	claudeRequest, err := relayconvert.OpenAIChatRequestToClaudeMessages(nil, &relaycommon.RelayInfo{}, request)
 	require.NoError(t, err)
 	require.Equal(t, "claude-opus-4-8", claudeRequest.Model)
 	require.NotNil(t, claudeRequest.Thinking)
@@ -304,7 +349,7 @@ func TestRequestOpenAI2ClaudeMessage_ClaudeOpus48HighUsesAdaptiveThinking(t *tes
 	require.Nil(t, claudeRequest.TopK)
 }
 
-func TestRequestOpenAI2ClaudeMessage_ClaudeOpus48ThinkingUsesAdaptiveHighEffort(t *testing.T) {
+func TestOpenAIChatRequestToClaudeMessages_ClaudeOpus48ThinkingUsesAdaptiveHighEffort(t *testing.T) {
 	request := dto.GeneralOpenAIRequest{
 		Model:       "claude-opus-4-8-thinking",
 		Temperature: commonPointer(0.7),
@@ -318,7 +363,7 @@ func TestRequestOpenAI2ClaudeMessage_ClaudeOpus48ThinkingUsesAdaptiveHighEffort(
 		},
 	}
 
-	claudeRequest, err := RequestOpenAI2ClaudeMessage(nil, request)
+	claudeRequest, err := relayconvert.OpenAIChatRequestToClaudeMessages(nil, &relaycommon.RelayInfo{}, request)
 	require.NoError(t, err)
 	require.Equal(t, "claude-opus-4-8", claudeRequest.Model)
 	require.NotNil(t, claudeRequest.Thinking)

@@ -253,11 +253,17 @@ type OpenAIVideoResponse struct {
 }
 
 type InputTokenDetails struct {
-	CachedTokens         int `json:"cached_tokens"`
-	CachedCreationTokens int `json:"cached_creation_tokens,omitempty"`
-	TextTokens           int `json:"text_tokens"`
-	AudioTokens          int `json:"audio_tokens"`
-	ImageTokens          int `json:"image_tokens"`
+	CachedTokens         int                       `json:"cached_tokens"`
+	CachedCreationTokens int                       `json:"cached_creation_tokens,omitempty"`
+	TextTokens           int                       `json:"text_tokens"`
+	AudioTokens          int                       `json:"audio_tokens"`
+	ImageTokens          int                       `json:"image_tokens"`
+	// 兼容阿里百炼 OpenAI 兼容协议下的非标准缓存写入字段。
+	// 阿里在 prompt_tokens_details 顶层返回 cache_creation_input_tokens，
+	// 并通过 cache_creation.ephemeral_5m_input_tokens 携带 5 分钟 TTL 的缓存写入 token 数。
+	// 这些字段不属于 OpenAI 官方协议，需要单独解析后在 usage 适配层回填到统一计费字段。
+	CacheCreationInputTokens int                      `json:"cache_creation_input_tokens,omitempty"`
+	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
 }
 
 type OutputTokenDetails struct {

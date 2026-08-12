@@ -17,6 +17,16 @@ func applyUsagePostProcessing(info *relaycommon.RelayInfo, usage *dto.Usage, res
 		if usage.PromptTokensDetails.CachedTokens == 0 && usage.PromptCacheHitTokens != 0 {
 			usage.PromptTokensDetails.CachedTokens = usage.PromptCacheHitTokens
 		}
+		// 兼容将阿里百炼渠道误配置为 DeepSeek 类型的情况：
+		// 阿里在 prompt_tokens_details 中返回 cache_creation_input_tokens 与
+		// cache_creation.ephemeral_5m_input_tokens，需要回填到统一计费字段。
+		applyAliCacheCreationTokens(usage)
+	case constant.ChannelTypeAli:
+		// 阿里百炼 OpenAI 兼容协议返回非标准字段：
+		//   - prompt_tokens_details.cache_creation_input_tokens：缓存写入 token 总数
+		//   - prompt_tokens_details.cache_creation.ephemeral_5m_input_tokens：5 分钟 TTL 缓存写入
+		// 标准协议字段 cached_creation_tokens 阿里不会返回，需要在此回填以触发缓存写入计费。
+		applyAliCacheCreationTokens(usage)
 	case constant.ChannelTypeZhipu_v4:
 		// 智普的cached_tokens在标准位置: usage.prompt_tokens_details.cached_tokens
 		if usage.PromptTokensDetails.CachedTokens == 0 {
@@ -130,4 +140,37 @@ func extractLlamaCachedTokensFromBody(body []byte) (int, bool) {
 		return 0, false
 	}
 	return *payload.Timings.CachedTokens, true
+}
+
+// applyAliCacheCreationTokens 将阿里百炼返回的非标准缓存写入字段回填到统一计费字段。
+//
+// 阿里百炼 OpenAI 兼容协议在 prompt_tokens_details 中返回：
+//   - cache_creation_input_tokens: 缓存写入 token 总数（顶层字段）
+//   - cache_creation.ephemeral_5m_input_tokens: 5 分钟 TTL 缓存写入 token 数（嵌套对象）
+//
+// new-api 计费链路使用 cached_creation_tokens 与 claude_cache_creation_5_m_tokens 作为
+// 统一字段。本函数把阿里非标准字段回填到统一字段，确保下游 text_quota.go 的缓存写入
+// 计费逻辑能够正确触发，避免平台少收缓存写入费用。
+//
+// 回填规则：
+//   1. 顶层 cache_creation_input_tokens -> CachedCreationTokens（仅在标准字段为 0 时回填，避免覆盖 OpenAI 标准协议返回值）
+//   2. 嵌套 ephemeral_5m_input_tokens -> ClaudeCacheCreation5mTokens（仅在为 0 时回填）
+func applyAliCacheCreationTokens(usage *dto.Usage) {
+	if usage == nil {
+		return
+	}
+
+	// 回填缓存写入总数（对应 CreateCacheRatio 计费）
+	// 仅在标准字段 cached_creation_tokens 为 0 时回填，避免覆盖 OpenAI 标准协议返回值
+	if usage.PromptTokensDetails.CachedCreationTokens == 0 &&
+		usage.PromptTokensDetails.CacheCreationInputTokens > 0 {
+		usage.PromptTokensDetails.CachedCreationTokens = usage.PromptTokensDetails.CacheCreationInputTokens
+	}
+
+	// 回填 5 分钟 TTL 缓存写入（对应 ClaudeCacheCreation5mTokens 计费）
+	if usage.ClaudeCacheCreation5mTokens == 0 &&
+		usage.PromptTokensDetails.CacheCreation != nil &&
+		usage.PromptTokensDetails.CacheCreation.Ephemeral5mInputTokens > 0 {
+		usage.ClaudeCacheCreation5mTokens = usage.PromptTokensDetails.CacheCreation.Ephemeral5mInputTokens
+	}
 }
